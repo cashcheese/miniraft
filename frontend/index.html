@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Distributed Drawing Board</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+        'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica',
+        'Arial', sans-serif;
+      background: #f0f0f0;
+    }
+
+    .top-bar {
+      height: 50px;
+      background: #282c34;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      font-size: 14px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    }
+
+    .title {
+      font-size: 18px;
+      font-weight: bold;
+      flex: 1;
+    }
+
+    .controls {
+      display: flex;
+      gap: 15px;
+      align-items: center;
+      flex: 1;
+      justify-content: center;
+    }
+
+    .controls label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .controls input[type="color"] {
+      width: 40px;
+      height: 30px;
+      border: none;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+
+    .controls input[type="range"] {
+      width: 100px;
+    }
+
+    .controls button {
+      padding: 6px 12px;
+      background: #e63946;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+
+    .controls button:hover {
+      background: #d62828;
+    }
+
+    .status-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 1;
+      justify-content: flex-end;
+    }
+
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #ff3b30;
+    }
+
+    .status-indicator.connected {
+      background: #34c759;
+      box-shadow: 0 0 8px rgba(52, 199, 89, 0.6);
+    }
+
+    .leader-info {
+      font-size: 12px;
+      color: #aaa;
+      max-width: 250px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    canvas {
+      display: block;
+      background: white;
+    }
+
+    .canvas-container {
+      height: calc(100vh - 50px);
+      width: 100%;
+      overflow: hidden;
+    }
+
+    .status-message {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: #282c34;
+      color: #ffeb3b;
+      padding: 12px 20px;
+      border-radius: 4px;
+      font-size: 12px;
+      display: none;
+      z-index: 1000;
+    }
+  </style>
+</head>
+<body>
+  <div class="top-bar">
+    <div class="title">Distributed Drawing Board</div>
+    
+    <div class="controls">
+      <label>
+        Color:
+        <input type="color" id="colorPicker" value="#e63946">
+      </label>
+      
+      <label>
+        Brush Size:
+        <input type="range" id="sizeSlider" min="2" max="20" value="4">
+        <span id="sizeDisplay">4</span>px
+      </label>
+      
+      <button id="clearBtn">Clear Canvas</button>
+    </div>
+
+    <div class="status-section">
+      <div class="status-indicator" id="statusIndicator"></div>
+      <div class="leader-info" id="leaderInfo">Connecting...</div>
+    </div>
+  </div>
+
+  <div class="canvas-container">
+    <canvas id="drawingCanvas"></canvas>
+  </div>
+
+  <div class="status-message" id="statusMessage"></div>
+
+  <script>
+    // Configuration
+    // Derive gateway URL dynamically so other laptops connect to the host they opened.
+    const GATEWAY_HOST = window.location.host || 'localhost:3000';
+    const GATEWAY_URL = `http://${GATEWAY_HOST}`;
+    const WS_URL = `ws://${GATEWAY_HOST}`;
+    const STATUS_CHECK_INTERVAL = 3000;
+    const RECONNECT_DELAY = 2000;
+
+    // Canvas setup
+    const canvas = document.getElementById('drawingCanvas');
+    const ctx = canvas.getContext('2d');
+    const container = document.querySelector('.canvas-container');
+
+    // UI Elements
+    const colorPicker = document.getElementById('colorPicker');
+    const sizeSlider = document.getElementById('sizeSlider');
+    const sizeDisplay = document.getElementById('sizeDisplay');
+    const clearBtn = document.getElementById('clearBtn');
+    const statusIndicator = document.getElementById('statusIndicator');
+    const leaderInfo = document.getElementById('leaderInfo');
+    const statusMessage = document.getElementById('statusMessage');
+
+    // State
+    let ws = null;
+    let isDrawing = false;
+    let currentPoints = [];
+    let drawnIds = new Set();
+    let isConnected = false;
+
+    // Initialize canvas size
+    function resizeCanvas() {
+      const rect = container.getBoundingClientRect();
+      canvas.width = rect.width;
+      canvas.height = rect.height;
+    }
+
+    // Handle window resize
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // Connect to WebSocket
+    function connectWebSocket() {
+      try {
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          isConnected = true;
+          statusIndicator.classList.add('connected');
+          statusIndicator.title = 'Connected';
+          console.log('[CLIENT] Connected to gateway');
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'stroke' && msg.stroke) {
+              // Draw stroke only if we haven't already drawn it
+              if (!drawnIds.has(msg.stroke.id)) {
+                drawStroke(msg.stroke);
+                drawnIds.add(msg.stroke.id);
+              }
+            } else if (msg.type === 'clear') {
+              // Handle clear command from other clients
+              clearCanvas();
+              console.log('[CLIENT] Canvas cleared by other client');
+            }
+          } catch (err) {
+            console.error('[CLIENT] Failed to parse message:', err);
+          }
+        };
+
+        ws.onerror = (err) => {
+          console.error('[CLIENT] WebSocket error:', err);
+          isConnected = false;
+          statusIndicator.classList.remove('connected');
+        };
+
+        ws.onclose = () => {
+          isConnected = false;
+          statusIndicator.classList.remove('connected');
+          statusIndicator.title = 'Disconnected';
+          console.log('[CLIENT] Disconnected from gateway');
+          
+          // Attempt reconnection
+          setTimeout(connectWebSocket, RECONNECT_DELAY);
+        };
+      } catch (err) {
+        console.error('[CLIENT] Failed to create WebSocket:', err);
+        setTimeout(connectWebSocket, RECONNECT_DELAY);
+      }
+    }
+
+    // Draw a stroke on canvas
+    function drawStroke(stroke) {
+      if (!stroke || !stroke.points || stroke.points.length === 0) return;
+
+      ctx.beginPath();
+      ctx.strokeStyle = stroke.color || '#e63946';
+      ctx.lineWidth = stroke.size || 4;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      const firstPoint = stroke.points[0];
+      ctx.moveTo(firstPoint.x, firstPoint.y);
+
+      for (let i = 1; i < stroke.points.length; i++) {
+        const point = stroke.points[i];
+        ctx.lineTo(point.x, point.y);
+      }
+
+      ctx.stroke();
+    }
+
+    // Mouse events for drawing
+    canvas.addEventListener('mousedown', (e) => {
+      isDrawing = true;
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      currentPoints = [{ x, y }];
+
+      // Draw dot at start
+      ctx.beginPath();
+      ctx.fillStyle = colorPicker.value;
+      ctx.arc(x, y, parseInt(sizeSlider.value) / 2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!isDrawing) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      currentPoints.push({ x, y });
+
+      // Draw line segment
+      ctx.beginPath();
+      ctx.strokeStyle = colorPicker.value;
+      ctx.lineWidth = parseInt(sizeSlider.value);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      
+      const prevPoint = currentPoints[currentPoints.length - 2];
+      ctx.moveTo(prevPoint.x, prevPoint.y);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    });
+
+    canvas.addEventListener('mouseup', async (e) => {
+      if (!isDrawing) return;
+
+      isDrawing = false;
+
+      // Send stroke to gateway
+      if (currentPoints.length > 0) {
+        const stroke = {
+          id: Date.now() + Math.random(),
+          points: currentPoints,
+          color: colorPicker.value,
+          size: parseInt(sizeSlider.value)
+        };
+
+        drawnIds.add(stroke.id);
+
+        try {
+          const response = await fetch(`${GATEWAY_URL}/stroke`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stroke })
+          });
+
+          if (response.status === 503) {
+            showStatusMessage('Electing leader...', 1000);
+            // Retry after delay
+            setTimeout(async () => {
+              try {
+                await fetch(`${GATEWAY_URL}/stroke`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ stroke })
+                });
+              } catch (err) {
+                console.error('[CLIENT] Retry failed:', err);
+              }
+            }, 1500);
+          } else if (!response.ok) {
+            console.error('[CLIENT] Failed to send stroke:', response.status);
+          }
+        } catch (err) {
+          console.error('[CLIENT] Fetch error:', err);
+        }
+      }
+
+      currentPoints = [];
+    });
+
+    // Prevent text selection while drawing
+    canvas.addEventListener('selectstart', (e) => e.preventDefault());
+
+    // Clear canvas function
+    function clearCanvas() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawnIds.clear();
+    }
+
+    // Clear button
+    clearBtn.addEventListener('click', () => {
+      clearCanvas();
+      
+      // Send clear command to gateway to sync across replicas
+      fetch(`${GATEWAY_URL}/clear`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }).catch((err) => {
+        console.error('[CLIENT] Failed to send clear command:', err);
+      });
+    });
+
+    // Size slider feedback
+    sizeSlider.addEventListener('change', () => {
+      sizeDisplay.textContent = sizeSlider.value;
+    });
+
+    // Show status message
+    function showStatusMessage(msg, duration = 3000) {
+      statusMessage.textContent = msg;
+      statusMessage.style.display = 'block';
+      setTimeout(() => {
+        statusMessage.style.display = 'none';
+      }, duration);
+    }
+
+    // Check leader status periodically
+    async function checkLeaderStatus() {
+      try {
+        const response = await fetch(`${GATEWAY_URL}/status`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.leaderUrl) {
+            leaderInfo.textContent = `Leader: ${data.leaderUrl}`;
+          } else {
+            leaderInfo.textContent = 'Leader: Electing...';
+          }
+        }
+      } catch (err) {
+        leaderInfo.textContent = 'Leader: Unknown';
+      }
+    }
+
+    // Initialize
+    connectWebSocket();
+    checkLeaderStatus(); // Initial check
+    setInterval(checkLeaderStatus, STATUS_CHECK_INTERVAL); // Periodic checks
+    checkLeaderStatus();
+    setInterval(checkLeaderStatus, STATUS_CHECK_INTERVAL);
+  </script>
+</body>
+</html>
